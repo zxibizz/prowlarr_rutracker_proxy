@@ -1,0 +1,69 @@
+---
+# Prowlarr + the RuTracker proxy + FlareSolverr.
+#
+#   docker compose up -d --build   start (builds the proxy image)
+#   docker compose logs -f         follow logs
+#   docker compose down            stop
+#
+# Order of operations on a fresh checkout:
+#   1. cp .env.example .env and fill in credentials and the SOCKS5 endpoint
+#   2. docker compose up -d --build     (the proxy generates ./data/ca/ca.crt)
+#   3. docker compose restart prowlarr  (picks the new CA up via /custom-cont-init.d)
+#   4. python3 scripts/configure_proxy.py
+
+services:
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=${FLARESOLVERR_LOG_LEVEL:-info}
+      - TZ=${TZ:-UTC}
+    restart: unless-stopped
+
+  rutracker-proxy:
+    build: .
+    image: rutracker-proxy:local
+    container_name: rutracker-proxy
+    depends_on:
+      - flaresolverr
+    environment:
+      - PROXY_PORT=8790
+      - RUTRACKER_MIRRORS=${RUTRACKER_MIRRORS:-https://rutracker.org,https://rutracker.net}
+      - RUTRACKER_USERNAME=${RUTRACKER_USERNAME:-}
+      - RUTRACKER_PASSWORD=${RUTRACKER_PASSWORD:-}
+      # socks5h:// resolves the tracker's name at the far end of the tunnel.
+      - SOCKS5_URL=${SOCKS5_URL:-}
+      - FLARESOLVERR_URL=http://flaresolverr:8191
+      - FLARESOLVERR_TIMEOUT_MS=${FLARESOLVERR_TIMEOUT_MS:-60000}
+      - MIRROR_FAIL_THRESHOLD=${MIRROR_FAIL_THRESHOLD:-2}
+      - MIRROR_RECHECK_SECONDS=${MIRROR_RECHECK_SECONDS:-900}
+      - REQUEST_DELAY=${REQUEST_DELAY:-0.25}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=${TZ:-UTC}
+    volumes:
+      # The CA and the tracker session. Prowlarr mounts ./data/ca read-only to
+      # install the certificate, so this directory is the link between the two.
+      - ./data:/data
+    ports:
+      # Published so you can poke at /status and /ca.crt from the host while
+      # developing. Prowlarr reaches it over the compose network instead.
+      - "8790:8790"
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    depends_on:
+      - rutracker-proxy
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ./config:/config
+      - ./data/ca:/rutracker-ca:ro
+      # Runs as root before Prowlarr starts; see prowlarr-init/README.
+      - ./prowlarr-init:/custom-cont-init.d:ro
+    ports:
+      - "9696:9696"
+    restart: unless-stopped

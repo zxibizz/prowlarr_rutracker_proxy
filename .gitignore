@@ -1,0 +1,11 @@
+# Secrets and per-deployment state. The CA private key lives in data/ca and must
+# never be committed: anyone holding it can forge any certificate this proxy's
+# clients trust.
+.env
+config/
+data/
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
