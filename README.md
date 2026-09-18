@@ -1,47 +1,43 @@
 # prowlarr_rutracker_proxy
 
-An HTTP proxy that sits between **Prowlarr** and **RuTracker** and makes the
+A reverse proxy that sits between **Prowlarr** and **RuTracker** and makes the
 tracker reachable, logged in, and unblocked — without patching Prowlarr.
 
-It is added in Prowlarr as an **Http indexer proxy** and attached to the
-RuTracker indexer with a tag. From there it:
+You point the RuTracker indexer's **Base Url** at it. From there it:
 
 - **solves Cloudflare / DDoS-Guard challenges** through FlareSolverr,
 - **routes everything through a SOCKS5 proxy**, both its own requests and the
   browser FlareSolverr drives,
 - **falls back from `rutracker.org` to `rutracker.net`** while rewriting every
-  response so Prowlarr only ever sees `rutracker.org`,
+  response so the mirror in use never leaks,
 - **owns the tracker login**, so the session survives restarts and a captcha can
   be answered in one place.
-
-## Why it has to MITM
-
-Prowlarr's RuTracker indexer is a **C# indexer**
-([`RuTracker.cs`](https://github.com/Prowlarr/Prowlarr/blob/develop/src/NzbDrone.Core/Indexers/Definitions/RuTracker.cs)),
-not a Cardigann YAML definition. Its *Base Url* is a dropdown built from the site
-links compiled into it — `https://rutracker.org/` and `https://rutracker.net/` —
-so there is no way to point it at a plain-HTTP origin and have a proxy answer in
-absolute form.
-
-Everything therefore arrives as `CONNECT rutracker.org:443`, and the only way to
-see inside is to terminate that TLS locally with a certificate Prowlarr trusts.
-The proxy generates its own CA on first boot for exactly that, and uses it **only**
-for the hosts in `MITM_HOSTS`:
 
 ```mermaid
 flowchart LR
     S["Sonarr / Radarr / search UI"] --> P["Prowlarr"]
-    P -->|"CONNECT rutracker.org:443"| X["rutracker-proxy :8790"]
-    P -->|"CONNECT prowlarr.servarr.com:443<br/>blind tunnel, real certificate"| N["health check"]
+    P -->|"GET /forum/tracker.php"| X["rutracker-proxy :8790"]
     X -->|"solve challenge"| F["FlareSolverr"]
     X -->|"SOCKS5"| M1["rutracker.org"]
     X -.->|"SOCKS5, on failover"| M2["rutracker.net"]
     F -->|"SOCKS5"| M1
 ```
 
-Prowlarr validates an indexer proxy by fetching `prowlarr.servarr.com` through
-it, so anything that is not RuTracker is passed through as an untouched TCP
-tunnel and keeps its real certificate.
+## Why the Base Url can be changed at all
+
+Prowlarr's RuTracker indexer is a **C# indexer**
+([`RuTracker.cs`](https://github.com/Prowlarr/Prowlarr/blob/develop/src/NzbDrone.Core/Indexers/Definitions/RuTracker.cs)),
+not a Cardigann YAML definition, and its *Base Url* renders as a dropdown built
+from the site links compiled into it. That is a **UI constraint only**:
+`IndexerFactory.Create`/`Update` overwrite `definition.IndexerUrls` but never
+validate or reset `Settings.BaseUrl`, so the API accepts any address.
+`scripts/configure_proxy.py` sets it over the API.
+
+The **trailing slash is required**. Prowlarr builds every link by concatenating
+`BaseUrl + "forum/" + href`, so without it you get `...8790forum/`.
+
+Because Prowlarr talks plain HTTP to this service and the service does the HTTPS
+leg itself, there is no TLS interception and no certificate to install anywhere.
 
 ## The login is the proxy's, not Prowlarr's
 
@@ -72,56 +68,60 @@ a mirror fails `MIRROR_FAIL_THRESHOLD` times in a row the next takes over, and
 the preferred one is probed again after `MIRROR_RECHECK_SECONDS`.
 
 Whatever mirror actually answered, its hostname is rewritten back to the
-canonical one — in the body, in `Location`, and in `Set-Cookie` domains — so
-every link Prowlarr parses says `rutracker.org` and comes back through here. The
-rewrite is done on raw bytes rather than decoded text on purpose: RuTracker
-serves **windows-1251**, and hostnames are ASCII, so byte substitution is both
-encoding-safe and cheaper than a decode/encode round trip.
+canonical one — in the body, in `Location`, and in `Set-Cookie` domains — so no
+mirror ever leaks into what Prowlarr parses. The rewrite is done on raw bytes
+rather than decoded text on purpose: RuTracker serves **windows-1251**, and
+hostnames are ASCII, so byte substitution is both encoding-safe and cheaper than
+a decode/encode round trip.
+
+Redirects and cookies are then pointed back at this service rather than the
+tracker, so a `Location` never sends Prowlarr at the blocked origin.
+
+## Cloudflare clearance is per-path
+
+A `cf_clearance` cookie is scoped to the Cloudflare rule that issued it. A
+clearance won on `index.php` is **rejected by `login.php`**, which is protected
+harder, so the proxy always solves the challenge on the path that was actually
+blocked. Asking FlareSolverr to solve an unchallenged page returns
+`Challenge not detected` and a cookie that clears nothing.
+
+FlareSolverr's browser is Chrome, whose `--proxy-server` has **no `socks5h`
+scheme** — it fails the whole connection with `ERR_INTERNET_DISCONNECTED`. Chrome's
+`socks5://` already resolves DNS at the far end, which is what `socks5h` means to
+`requests`, so `SOCKS5_URL` is normalised for FlareSolverr and left alone for the
+upstream client.
 
 ## Quick start
 
 ```
 cp .env.example .env          # credentials + SOCKS5 endpoint
-docker compose up -d --build  # generates ./data/ca/ca.crt on first boot
-docker compose restart prowlarr
+docker compose up -d --build
+set -a; source .env; set +a   # the scripts read these from the environment
 python3 scripts/configure_proxy.py
 ```
 
-Step 3 is not optional: the init script in `prowlarr-init/` installs the proxy's
-CA into Prowlarr's trust store, and it can only do that once the CA exists.
+In Prowlarr, add the **RuTracker** indexer with a blank username and password
+first. `scripts/configure_proxy.py` then points its Base Url at this service and
+clears the tag and Http indexer proxy that older versions of this project needed.
 
-Then, in Prowlarr, add the **RuTracker** indexer with a blank username and
-password. `scripts/configure_proxy.py` creates the tag, creates the Http indexer
-proxy, and attaches the tag to that indexer.
-
-### If Prowlarr skips the init script
-
-linuxserver images refuse to run files in `/custom-cont-init.d` that are not
-owned by root:
+By default it sets `http://rutracker-proxy:8790/`, which works when Prowlarr is
+the container in this compose file. For a Prowlarr elsewhere, pass an address it
+can actually route to:
 
 ```
-sudo chown root:root prowlarr-init/*.sh && chmod 755 prowlarr-init/*.sh
-```
-
-You can always install the CA by hand instead:
-
-```
-docker compose exec prowlarr sh -c \
-  'cp /rutracker-ca/ca.crt /usr/local/share/ca-certificates/ && update-ca-certificates'
-docker compose restart prowlarr
+python3 scripts/configure_proxy.py http://192.168.1.10:8790/
 ```
 
 ## Verifying
 
 ```
-python3 scripts/test_proxy.py      # the proxy alone: tunnel, MITM, login, search, download
+python3 scripts/test_proxy.py      # the proxy alone: login, search, download
 python3 scripts/test_indexer.py    # end to end through Prowlarr
 ```
 
-`test_proxy.py` deliberately checks that `prowlarr.servarr.com` is *not*
-intercepted, that `rutracker.net` never leaks into a response, and that a
-download link yields bytes starting with `d8:announce` rather than an HTML error
-page.
+`test_proxy.py` checks that the session is logged in, that a search returns rows,
+that no foreign mirror hostname leaks into the page, and that a download link
+yields bytes starting with `d8:announce` rather than an HTML error page.
 
 ## Layout
 
@@ -129,13 +129,11 @@ page.
 docker-compose.yml                    Prowlarr + the proxy + FlareSolverr
 Dockerfile                            the proxy image
 proxy/config.py                       every environment knob, in one place
-proxy/ca.py                           the CA, and a leaf certificate per intercepted host
 proxy/upstream.py                     SOCKS5, mirror failover, hostname rewriting
 proxy/session.py                      login, bb_session/cf_clearance, captcha handling
 proxy/flaresolverr.py                 challenge detection and solving
-proxy/app.py                          the listener: CONNECT split, routing, local endpoints
-prowlarr-init/                        installs the CA into the Prowlarr container
-scripts/configure_proxy.py            tag + indexer proxy + indexer, via the Prowlarr API
+proxy/app.py                          the listener: routing and local endpoints
+scripts/configure_proxy.py            sets the indexer's Base Url, via the Prowlarr API
 scripts/test_proxy.py                 the proxy alone
 scripts/test_indexer.py               end to end through Prowlarr
 ```
@@ -144,10 +142,10 @@ scripts/test_indexer.py               end to end through Prowlarr
 
 | Endpoint | What it does |
 | --- | --- |
+| `/forum/...` | the tracker itself |
 | `GET /healthz` | liveness probe, used by the container healthcheck |
 | `GET /` | what this service is and how it is wired |
 | `GET /status` | active mirror, session age, clearance cookies, last error |
-| `GET /ca.crt` | the CA to trust in Prowlarr |
 | `GET /captcha` | the pending login captcha image, when there is one |
 | `POST /login` | finish a captcha-blocked login: `code=<value>` |
 
@@ -158,8 +156,6 @@ scripts/test_indexer.py               end to end through Prowlarr
 | `RUTRACKER_USERNAME` / `RUTRACKER_PASSWORD` | — | the account the proxy logs in with |
 | `SOCKS5_URL` | — | e.g. `socks5h://host:1080`; empty means go direct |
 | `RUTRACKER_MIRRORS` | `https://rutracker.org,https://rutracker.net` | first entry is canonical |
-| `MITM_HOSTS` | `rutracker.org,rutracker.net` | the only hosts whose TLS is terminated |
-| `SOCKS_TUNNEL_SUFFIXES` | `rutracker.org,rutracker.net,rutracker.cc,rutracker.nl` | tunnelled hosts that still go via SOCKS5 |
 | `FLARESOLVERR_URL` | `http://flaresolverr:8191` | set empty, or `FLARESOLVERR_ENABLED=false`, to disable |
 | `FLARESOLVERR_TIMEOUT_MS` | `60000` | per-solve budget |
 | `FLARESOLVERR_SESSION_TTL_MINUTES` | `30` | `0` launches a fresh browser per solve |
@@ -168,21 +164,20 @@ scripts/test_indexer.py               end to end through Prowlarr
 | `REQUEST_DELAY` | `0.25` | minimum gap between upstream requests, in seconds |
 | `HTTP_TIMEOUT` | `30` | per-request timeout, in seconds |
 | `PROXY_PORT` | `8790` | listener port |
-| `STATE_DIR` / `CA_DIR` | `/data`, `/data/ca` | where the session and the CA live |
+| `STATE_DIR` | `/data` | where the session lives |
 | `LOG_LEVEL` | `INFO` | `DEBUG` logs every upstream URL |
+
+`PROWLARR_URL` and `PROWLARR_API_KEY` are read by the scripts from the
+environment, not by the containers. Compose loads `.env` for the services, but
+your shell does not — `set -a; source .env; set +a` first.
 
 ## Security
 
-The CA in `./data/ca` is a **trust anchor**: anything that trusts it will accept
-a certificate it signs for *any* host. So:
+This service answers **origin-form requests only**; an absolute-form request is
+rejected, so it cannot be used as a forward proxy. It has no authentication,
+though, and anyone who can reach it can search the tracker as your account and
+download torrents through your session. Expose port 8790 only on a network
+Prowlarr and you control, never the public internet.
 
-- it is generated per deployment on first boot, never shipped in the image and
-  never committed (`data/` is in `.gitignore`);
-- the private key is written `0600`;
-- only the hosts in `MITM_HOSTS` are ever intercepted — everything else is
-  blind-tunnelled and keeps its real certificate;
-- upstream TLS is **verified** normally; the proxy never disables verification.
-
-Do not expose port 8790 beyond the host or the compose network. It is a forward
-proxy, and while plain-HTTP relaying is restricted to RuTracker, `CONNECT` has to
-stay open for Prowlarr's own health check.
+`RUTRACKER_PASSWORD` and the `bb_session` cookie in `./data` are credentials for
+your tracker account. `data/` and `.env` are both in `.gitignore`.

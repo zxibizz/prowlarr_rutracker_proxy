@@ -20,7 +20,6 @@ import xml.etree.ElementTree as ET
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PROWLARR = os.environ.get("PROWLARR_URL", "http://localhost:9696").rstrip("/")
-CANONICAL = "rutracker.org"
 
 
 def api_key() -> str:
@@ -66,13 +65,19 @@ def main() -> int:
     )
     if not indexer:
         sys.exit("No RuTracker indexer in Prowlarr. Add it, then run scripts/configure_proxy.py.")
-    print(f"indexer {indexer['name']!r} (id {indexer['id']}), tags {indexer.get('tags')}")
 
-    if not indexer.get("tags"):
-        print("  warning: no tags, so no indexer proxy applies - run scripts/configure_proxy.py")
+    base_url = next(
+        (f.get("value") for f in indexer.get("fields", []) if f.get("name") == "baseUrl"), ""
+    )
+    print(f"indexer {indexer['name']!r} (id {indexer['id']}), base url {base_url!r}")
+
+    if "rutracker.org" in base_url or "rutracker.net" in base_url:
+        print("  warning: base url still points at the tracker - run scripts/configure_proxy.py")
 
     print("\ntest")
-    status, detail = api(f"/api/v1/indexer/{indexer['id']}/test", "POST", indexer)
+    # Prowlarr tests a provider by POSTing the whole definition to /test;
+    # /indexer/{id}/test is GET-only and answers 405.
+    status, detail = api("/api/v1/indexer/test", "POST", indexer)
     if status >= 400:
         print(f"  FAIL  HTTP {status}: {detail}")
         return 1
@@ -90,12 +95,12 @@ def main() -> int:
     if not results:
         return 1
 
-    foreign = [r for r in results if CANONICAL not in (r.get("infoUrl") or "")]
+    foreign = [r for r in results if not (r.get("infoUrl") or "").startswith(base_url)]
     if foreign:
-        print(f"  FAIL  {len(foreign)} result(s) do not point at {CANONICAL}")
+        print(f"  FAIL  {len(foreign)} result(s) do not point at {base_url}")
         print(f"        e.g. {foreign[0].get('infoUrl')}")
         return 1
-    print(f"  ok    every result points at {CANONICAL}")
+    print(f"  ok    every result points at {base_url}")
 
     for row in results[:5]:
         size = (row.get("size") or 0) / 1024 ** 3

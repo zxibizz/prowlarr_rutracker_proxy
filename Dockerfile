@@ -11,8 +11,8 @@ ENV PROXY_PORT=8790 \
     STATE_DIR=/data \
     PYTHONUNBUFFERED=1
 
-# The CA and the tracker session live here; keep it on a volume so a restart does
-# not invalidate the certificate Prowlarr trusts or force a fresh login.
+# The tracker session lives here; keep it on a volume so a restart does not
+# force a fresh login.
 VOLUME ["/data"]
 EXPOSE 8790
 

@@ -64,7 +64,15 @@ class FlareSolverr:
     # FlareSolverr itself is a neighbour on the compose network; only the browser
     # it drives needs the SOCKS tunnel, which is what this block asks for.
     def _proxy_block(self) -> dict | None:
-        return {"url": config.SOCKS5_URL} if config.SOCKS5_URL else None
+        if not config.SOCKS5_URL:
+            return None
+        # Chrome's --proxy-server has no socks5h scheme and fails the whole
+        # connection with ERR_INTERNET_DISCONNECTED; its socks5 already resolves
+        # DNS at the far end, which is exactly what socks5h means to requests.
+        url = config.SOCKS5_URL
+        if url.startswith("socks5h://"):
+            url = "socks5://" + url[len("socks5h://") :]
+        return {"url": url}
 
     def _post(self, payload: dict) -> dict:
         timeout = config.FLARESOLVERR_TIMEOUT_MS / 1000.0 + 30.0

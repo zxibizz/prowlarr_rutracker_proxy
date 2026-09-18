@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Wire the proxy into Prowlarr: a tag, an Http indexer proxy, and the RuTracker indexer.
+"""Point Prowlarr's RuTracker indexer at this proxy by setting its Base Url.
 
-This is what to do by hand in *Settings -> Indexer Proxies* (add an "Http" proxy
-pointed at this service), plus a tag, plus that tag on the RuTracker indexer.
+    python3 scripts/configure_proxy.py                      # http://rutracker-proxy:8790/
+    python3 scripts/configure_proxy.py http://box.lan:8790  # proxy elsewhere
+    python3 scripts/configure_proxy.py --remove             # back to https://rutracker.org/
 
-    python3 scripts/configure_proxy.py                      # rutracker-proxy:8790
-    python3 scripts/configure_proxy.py myhost.local:8790    # proxy elsewhere
-    python3 scripts/configure_proxy.py --remove             # undo
+Prowlarr renders Base Url as a dropdown of the URLs compiled into its C# indexer,
+but that is a UI constraint only: ``IndexerFactory`` never validates the stored
+value, so the API accepts any address.
 
-Prowlarr validates the address when it saves, so an unreachable host is rejected
-with a clear error rather than silently breaking.
+The trailing slash is not optional. Prowlarr builds every link by concatenating
+``BaseUrl + "forum/" + href``, so without it you get ``...8790forum/``.
+
+Also clears the tag and Http indexer proxy that older, MITM-based versions of
+this project created, if they are still there.
 """
 
 from __future__ import annotations
@@ -24,10 +28,9 @@ import xml.etree.ElementTree as ET
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PROWLARR = os.environ.get("PROWLARR_URL", "http://localhost:9696").rstrip("/")
-PROXY_NAME = "rutracker-proxy"
-TAG_LABEL = "rutracker-proxy"
-DEFAULT_ADDRESS = "rutracker-proxy:8790"
-DEFAULT_PORT = 8790
+LEGACY_NAME = "rutracker-proxy"
+DEFAULT_BASE_URL = "http://rutracker-proxy:8790/"
+UPSTREAM_BASE_URL = "https://rutracker.org/"
 
 
 def api_key() -> str:
@@ -63,12 +66,12 @@ def api(path: str, method: str = "GET", body: object = None):
 
 def find_tag():
     _, tags = api("/api/v1/tag")
-    return next((t for t in (tags or []) if t.get("label") == TAG_LABEL), None)
+    return next((t for t in (tags or []) if t.get("label") == LEGACY_NAME), None)
 
 
 def find_proxy():
     _, proxies = api("/api/v1/indexerproxy")
-    return next((p for p in (proxies or []) if p.get("name") == PROXY_NAME), None)
+    return next((p for p in (proxies or []) if p.get("name") == LEGACY_NAME), None)
 
 
 def find_indexer():
@@ -79,14 +82,6 @@ def find_indexer():
     return None
 
 
-def http_schema():
-    _, schema = api("/api/v1/indexerproxy/schema")
-    for candidate in schema or []:
-        if (candidate.get("implementation") or "").lower() == "http":
-            return candidate
-    sys.exit("Prowlarr does not offer an 'Http' indexer proxy implementation.")
-
-
 def set_field(payload: dict, name: str, value) -> None:
     for field in payload.get("fields", []):
         if field.get("name") == name:
@@ -95,76 +90,64 @@ def set_field(payload: dict, name: str, value) -> None:
     payload.setdefault("fields", []).append({"name": name, "value": value})
 
 
-def remove() -> int:
+def get_field(payload: dict, name: str):
+    for field in payload.get("fields", []):
+        if field.get("name") == name:
+            return field.get("value")
+    return None
+
+
+def drop_legacy_wiring() -> None:
+    """Undo the tag + Http indexer proxy that the MITM-based version needed."""
     indexer = find_indexer()
     tag = find_tag()
     if indexer and tag and tag["id"] in (indexer.get("tags") or []):
         indexer["tags"] = [t for t in indexer["tags"] if t != tag["id"]]
         api(f"/api/v1/indexer/{indexer['id']}?forceSave=true", "PUT", indexer)
-        print("removed the tag from the RuTracker indexer")
+        print("removed the legacy tag from the RuTracker indexer")
 
     proxy = find_proxy()
     if proxy:
         api(f"/api/v1/indexerproxy/{proxy['id']}", "DELETE")
-        print(f"deleted indexer proxy {proxy['id']}")
+        print(f"deleted legacy indexer proxy {proxy['id']}")
 
     if tag:
         api(f"/api/v1/tag/{tag['id']}", "DELETE")
-        print(f"deleted tag {tag['id']}")
+        print(f"deleted legacy tag {tag['id']}")
 
-    print("\nNote: RuTracker will now be reached directly, which is what this proxy existed to avoid.")
-    return 0
+
+def normalise(url: str) -> str:
+    if "://" not in url:
+        url = "http://" + url
+    return url if url.endswith("/") else url + "/"
 
 
 def main() -> int:
-    if "--remove" in sys.argv:
-        return remove()
-
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    address = args[0] if args else DEFAULT_ADDRESS
-    host, _, port_text = address.rpartition(":")
-    if not host:
-        host, port = address, DEFAULT_PORT
-    else:
-        port = int(port_text) if port_text.isdigit() else DEFAULT_PORT
+    removing = "--remove" in sys.argv
+    base_url = UPSTREAM_BASE_URL if removing else normalise(args[0] if args else DEFAULT_BASE_URL)
 
-    status, tag = api("/api/v1/tag", "POST", {"label": TAG_LABEL})
-    if not isinstance(tag, dict) or "id" not in tag:
-        tag = find_tag()
-    if not tag:
-        sys.exit(f"could not create the tag: HTTP {status}")
-    print(f"tag {TAG_LABEL!r} -> id {tag['id']}")
-
-    payload = find_proxy() or http_schema()
-    payload["name"] = PROXY_NAME
-    payload["tags"] = [tag["id"]]
-    set_field(payload, "host", host)
-    set_field(payload, "port", port)
-
-    if "id" in payload:
-        status, saved = api(f"/api/v1/indexerproxy/{payload['id']}", "PUT", payload)
-    else:
-        status, saved = api("/api/v1/indexerproxy", "POST", payload)
-    if status >= 400:
-        sys.exit(f"could not save the indexer proxy: HTTP {status}: {saved}")
-    print(f"indexer proxy {PROXY_NAME!r} -> {host}:{port}")
+    drop_legacy_wiring()
 
     indexer = find_indexer()
     if not indexer:
         print("\nNo RuTracker indexer found. Add it in Prowlarr, then re-run this script.")
         print("Leave its username/password blank: this proxy owns the tracker session.")
-        return 0
+        return 1
 
-    tags = set(indexer.get("tags") or [])
-    tags.add(tag["id"])
-    indexer["tags"] = sorted(tags)
+    before = get_field(indexer, "baseUrl")
+    set_field(indexer, "baseUrl", base_url)
     status, saved = api(f"/api/v1/indexer/{indexer['id']}?forceSave=true", "PUT", indexer)
     if status >= 400:
-        sys.exit(f"could not tag the indexer: HTTP {status}: {saved}")
-    print(f"tagged indexer {indexer['name']!r} (id {indexer['id']})")
+        sys.exit(f"could not set the Base Url: HTTP {status}: {saved}")
 
-    print("\nNext: make sure Prowlarr trusts the proxy's CA, then test the indexer:")
-    print(f"  curl -s -H 'X-Api-Key: ...' -X POST {PROWLARR}/api/v1/indexer/{indexer['id']}/test")
+    print(f"indexer {indexer['name']!r} (id {indexer['id']}) base url: {before} -> {base_url}")
+    if removing:
+        print("\nNote: RuTracker is now reached directly, which is what this proxy existed to avoid.")
+        return 0
+
+    print("\nNext, test it:")
+    print(f"  python3 scripts/test_indexer.py")
     return 0
 
 

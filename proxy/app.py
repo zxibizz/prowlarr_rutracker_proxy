@@ -1,55 +1,47 @@
 #!/usr/bin/env python3
-"""A MITM HTTP proxy that makes Prowlarr's RuTracker indexer work from anywhere.
+"""A reverse proxy that makes Prowlarr's RuTracker indexer work from anywhere.
 
-Prowlarr reaches this through its built-in **"Http" indexer proxy**, assigned to
-the RuTracker indexer with a tag. Because RuTracker is an *https* site, every
-request arrives as ``CONNECT rutracker.org:443`` rather than in absolute form,
-so there is nothing to divert unless the TLS is terminated here. That is what
-this does, and only for the hosts in ``MITM_HOSTS``:
+Prowlarr reaches this by pointing the RuTracker indexer's **Base Url** straight
+at it, so every request arrives in ordinary origin form over plain HTTP:
 
-    CONNECT rutracker.org:443     -> terminated here with a cert from our own CA
-    CONNECT anything-else:443     -> blind TCP tunnel, real certificate intact
+    GET /forum/tracker.php?nm=... -> reissued upstream through SOCKS5
 
-The second line matters: Prowlarr validates an indexer proxy by fetching
-prowlarr.servarr.com through it, and that check has to keep working.
+Prowlarr's Base Url renders as a dropdown built from URLs compiled into its C#
+indexer, but that is a UI constraint only: ``IndexerFactory`` never validates
+the stored value, so the API accepts any address. ``scripts/configure_proxy.py``
+sets it. The trailing slash matters - Prowlarr builds links by concatenating
+``BaseUrl + "forum/" + href``.
 
-Inside the intercepted connection the proxy:
+The proxy:
 
 * answers ``login.php`` itself, so Prowlarr never authenticates against the
   tracker and **the credentials configured on the Prowlarr indexer are ignored**
   - the ones in this container's environment are what get used;
 * reissues every other request through SOCKS5 against whichever mirror is
   currently healthy, falling back from rutracker.org to rutracker.net;
-* rewrites the mirror's hostname back to rutracker.org in the body, the
-  redirects and the cookies, so every link Prowlarr parses points at the
-  canonical host and comes back through here;
+* rewrites the mirror's hostname back to rutracker.org in the body, and points
+  redirects and cookies back at itself, so every link Prowlarr parses comes back
+  through here;
 * solves Cloudflare/DDoS-Guard interstitials through FlareSolverr and retries.
 
-Local endpoints on the plain listener, for humans and health checks:
+Everything under ``/forum/`` is the tracker. The rest is local:
 
     GET  /healthz    liveness probe
     GET  /           what this service is and how it is wired
     GET  /status     active mirror, session age, last error
-    GET  /ca.crt     the CA to install in Prowlarr's trust store
     GET  /captcha    the pending login captcha image, when there is one
     POST /login      finish a captcha-blocked login: code=<what the image says>
 """
 
 from __future__ import annotations
 
-import io
 import json
 import logging
-import os
-import select
-import socket
-import ssl
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import config
-from .ca import CertificateAuthority
 from .flaresolverr import FlareSolverr, looks_like_challenge
 from .session import CaptchaRequired, LoginFailed, LOGGED_IN_MARKER, RuTrackerSession
 from .upstream import Upstream, UpstreamError
@@ -70,88 +62,9 @@ SYNTHETIC_LOGIN = (
 )
 
 
-class _SocketWriter(io.BufferedIOBase):
-    """Unbuffered, sendall-backed writer - what socketserver uses for wbufsize 0."""
-
-    def __init__(self, sock: socket.socket) -> None:
-        self._sock = sock
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, data):  # type: ignore[override]
-        self._sock.sendall(data)
-        with memoryview(data) as view:
-            return view.nbytes
-
-    def fileno(self) -> int:
-        return self._sock.fileno()
-
-
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "RuTrackerProxy/1.0"
-
-    mitm_host: str | None = None
-
-    # ------------------------------------------------------------------ CONNECT
-    def do_CONNECT(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        host, _, port_text = self.path.rpartition(":")
-        try:
-            port = int(port_text) if port_text else 443
-        except ValueError:
-            host, port = self.path, 443
-
-        if config.is_mitm_host(host):
-            self._intercept(host)
-        else:
-            self._tunnel(host, port)
-
-    def _intercept(self, host: str) -> None:
-        """Terminate the client's TLS with a cert minted for this host."""
-        try:
-            context = self.server.ca.context_for(host)
-        except Exception as exc:  # noqa: BLE001 - without a cert there is nothing to serve
-            log.error("cannot mint a certificate for %s: %s", host, exc)
-            self.send_error(500, "certificate generation failed")
-            return
-
-        self.send_response(200, "Connection Established")
-        self.end_headers()
-        self.wfile.flush()
-
-        try:
-            tls = context.wrap_socket(self.connection, server_side=True)
-        except (ssl.SSLError, OSError) as exc:
-            log.warning("TLS handshake with %s failed: %s", host, exc)
-            self.close_connection = True
-            return
-
-        log.debug("intercepting %s", host)
-        self.connection = tls
-        self.rfile = tls.makefile("rb", self.rbufsize)
-        self.wfile = _SocketWriter(tls)
-        self.mitm_host = host
-        self.close_connection = False
-
-    def _tunnel(self, host: str, port: int) -> None:
-        """Blind TCP relay - this is how Prowlarr's own proxy health check gets out."""
-        try:
-            upstream = _open_socket(host, port)
-        except OSError as exc:
-            log.warning("CONNECT %s:%s failed: %s", host, port, exc)
-            self.send_error(502, f"cannot connect to {host}:{port}")
-            return
-
-        log.debug("tunnelling %s:%s", host, port)
-        self.send_response(200, "Connection Established")
-        self.end_headers()
-        self.wfile.flush()
-        try:
-            _pump(self.connection, upstream)
-        finally:
-            upstream.close()
-            self.close_connection = True
 
     # ------------------------------------------------------------------ requests
     def do_GET(self) -> None:  # noqa: N802
@@ -170,24 +83,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._handle("DELETE")
 
     def _handle(self, method: str) -> None:
-        if self.mitm_host:
-            self._handle_site(method, self.path)
-            return
-
         if self.path.startswith("/"):
             self._handle_local(method, self.path)
             return
-
-        # Absolute-form plain http. Only the tracker is in scope; relaying anything
-        # else would make this an open proxy.
-        parts = urllib.parse.urlsplit(self.path)
-        if config.is_mitm_host(parts.hostname or ""):
-            path = parts.path or "/"
-            if parts.query:
-                path = f"{path}?{parts.query}"
-            self._handle_site(method, path)
-            return
-        self.send_error(403, "this proxy only relays RuTracker traffic")
+        # Absolute-form means someone is treating this as a forward proxy, which
+        # it is not; relaying that would make it an open proxy.
+        self.send_error(400, "this service only answers origin-form requests")
 
     def _read_body(self) -> bytes | None:
         length = self.headers.get("Content-Length")
@@ -268,7 +169,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             if looks_like_challenge(response.status, response.headers, response.content):
                 log.info("challenge on %s (attempt %d)", target, attempt + 1)
-                if not session.refresh_clearance(clearance_generation):
+                if not session.refresh_clearance(
+                    clearance_generation, urllib.parse.urlsplit(target).path
+                ):
                     self._send_bytes(
                         502, "text/plain; charset=utf-8", b"a challenge could not be solved"
                     )
@@ -324,6 +227,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         parts = urllib.parse.urlsplit(target)
         path = parts.path
 
+        # Prowlarr's Base Url points here, so tracker paths arrive in origin form.
+        if path.startswith("/forum/"):
+            self._handle_site(method, target)
+            return
+
         if path == "/login" and method == "POST":
             self._finish_captcha(parts.query)
             return
@@ -334,8 +242,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             self._send_json(200, {"ok": True})
-        elif path == "/ca.crt":
-            self._send_bytes(200, "application/x-pem-file", self.server.ca.ca_pem)
         elif path == "/status":
             self._send_json(
                 200,
@@ -356,15 +262,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 {
                     "service": "prowlarr-rutracker-proxy",
                     "how_it_works": (
-                        "add this as an Http indexer proxy in Prowlarr and tag the RuTracker "
-                        "indexer with it; install /ca.crt in Prowlarr's trust store first"
+                        "point the RuTracker indexer's Base Url at this service, "
+                        "trailing slash included; run scripts/configure_proxy.py to set it"
                     ),
                     "note": "the credentials on the Prowlarr indexer are ignored; this proxy owns the session",
-                    "mitm_hosts": config.MITM_HOSTS,
+                    "mirrors": config.MIRRORS,
                     "endpoints": {
+                        "/forum/...": "the tracker itself",
                         "/healthz": "liveness probe",
                         "/status": "active mirror, session age, last error",
-                        "/ca.crt": "the CA to trust in Prowlarr",
                         "/captcha": "pending login captcha image, if any",
                         "POST /login": "finish a captcha-blocked login: code=<value>",
                     },
@@ -404,11 +310,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _send_upstream(self, response) -> None:
         self.send_response(response.status)
         for name, value in response.headers:
-            self.send_header(name, value)
+            self.send_header(name, self._localise(name, value))
         self.send_header("Content-Length", str(len(response.content)))
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(response.content)
+
+    def _localise(self, name: str, value: str) -> str:
+        """Keep redirects and cookies on this proxy rather than the tracker.
+
+        Prowlarr talks to us by our own hostname, so a ``Location`` pointing at
+        rutracker.org would send it straight at the blocked origin, and a
+        ``Domain=rutracker.org`` cookie would be rejected as a domain mismatch.
+        """
+        host = self.headers.get("Host")
+        if not host:
+            return value
+
+        lowered = name.lower()
+        if lowered == "location":
+            canonical = config.canonical_host()
+            for scheme in ("https://", "http://"):
+                prefix = scheme + canonical
+                if value.startswith(prefix):
+                    return f"http://{host}{value[len(prefix):]}"
+            return value
+        if lowered == "set-cookie":
+            return _strip_cookie_domain(value)
+        return value
 
     def _send_bytes(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
@@ -429,48 +358,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         log.debug("%s %s", self.address_string(), fmt % args)
 
 
-def _open_socket(host: str, port: int) -> socket.socket:
-    """A plain socket, or one dialled through SOCKS5 when the host is tracker-adjacent."""
-    if config.SOCKS5_URL and config.tunnel_via_socks(host):
-        import socks  # PySocks, pulled in by requests[socks]
-
-        parsed = urllib.parse.urlsplit(config.SOCKS5_URL)
-        sock = socks.socksocket()
-        sock.set_proxy(
-            socks.SOCKS5,
-            parsed.hostname,
-            parsed.port or 1080,
-            rdns=True,
-            username=parsed.username,
-            password=parsed.password,
-        )
-        sock.settimeout(config.HTTP_TIMEOUT)
-        sock.connect((host, port))
-        return sock
-    return socket.create_connection((host, port), timeout=config.HTTP_TIMEOUT)
-
-
-def _pump(client: socket.socket, upstream: socket.socket) -> None:
-    while True:
-        try:
-            readable, _, errored = select.select([client, upstream], [], [client, upstream], 300)
-        except (OSError, ValueError):
-            return
-        if errored or not readable:
-            return
-        for source in readable:
-            try:
-                data = source.recv(65536)
-            except OSError:
-                return
-            if not data:
-                return
-            try:
-                (upstream if source is client else client).sendall(data)
-            except OSError:
-                return
-
-
 def _login_error(message: str) -> bytes:
     safe = message.replace("<", "&lt;").encode("utf-8", "replace")
     return (
@@ -480,12 +367,20 @@ def _login_error(message: str) -> bytes:
     )
 
 
+def _strip_cookie_domain(value: str) -> str:
+    kept = [
+        part
+        for part in value.split(";")
+        if part.strip().split("=", 1)[0].strip().lower() != "domain"
+    ]
+    return ";".join(kept)
+
+
 class ProxyServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, handler, ca, upstream, session, solver):
-        self.ca = ca
+    def __init__(self, address, handler, upstream, session, solver):
         self.upstream = upstream
         self.session = session
         self.solver = solver
@@ -494,9 +389,7 @@ class ProxyServer(ThreadingHTTPServer):
 
 def main() -> None:
     config.setup_logging()
-    os.makedirs(config.STATE_DIR, exist_ok=True)
 
-    ca = CertificateAuthority(config.CA_DIR)
     upstream = Upstream()
     solver = FlareSolverr()
     session = RuTrackerSession(upstream, solver)
@@ -504,11 +397,10 @@ def main() -> None:
     # Logging in can take a browser launch; do not hold up the listener for it.
     threading.Thread(target=_warm_up, args=(session,), daemon=True).start()
 
-    server = ProxyServer((config.BIND, config.PORT), ProxyHandler, ca, upstream, session, solver)
+    server = ProxyServer((config.BIND, config.PORT), ProxyHandler, upstream, session, solver)
     log.info("listening on %s:%s", config.BIND, config.PORT)
-    log.info("intercepting %s, tunnelling everything else", ", ".join(config.MITM_HOSTS))
     log.info("mirrors: %s", ", ".join(config.MIRRORS))
-    log.info("install %s in Prowlarr's trust store (also served at /ca.crt)", ca.cert_path)
+    log.info("point the RuTracker indexer's Base Url here, trailing slash included")
 
     try:
         server.serve_forever()

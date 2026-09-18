@@ -39,6 +39,9 @@ log = logging.getLogger("session")
 LOGIN_PATH = "/forum/login.php"
 INDEX_PATH = "/forum/index.php"
 
+# A challenge that survives this many solves is not going to clear by retrying.
+MAX_LOGIN_ATTEMPTS = 3
+
 # The marker Prowlarr's own indexer uses to decide whether it is logged in.
 LOGGED_IN_MARKER = b'id="logged-in-username"'
 
@@ -138,13 +141,23 @@ class RuTrackerSession:
         return self._clearance_generation
 
     # ------------------------------------------------------------------ challenge
-    def refresh_clearance(self, seen_generation: int | None = None) -> bool:
-        """Solve the interstitial once, however many callers noticed it at the same time."""
+    def refresh_clearance(self, seen_generation: int | None = None, path: str | None = None) -> bool:
+        """Solve the interstitial once, however many callers noticed it at the same time.
+
+        The clearance is scoped to the Cloudflare rule that issued the challenge,
+        so it has to be won on the path that was actually blocked: a clearance
+        earned on index.php is rejected by login.php, which is protected harder.
+        Solving an unchallenged page yields "Challenge not detected" and a cookie
+        that clears nothing.
+        """
         with self._clearance_lock:
             if seen_generation is not None and seen_generation != self._clearance_generation:
                 return True
+            # A browser pointed at dl.php downloads a torrent instead of rendering.
+            if not path or path.startswith("/forum/dl.php"):
+                path = INDEX_PATH
             try:
-                cookies, user_agent = self.solver.solve(self.upstream.active + "/forum/index.php")
+                cookies, user_agent = self.solver.solve(self.upstream.active + path)
             except (FlareSolverrError, Exception) as exc:  # noqa: BLE001 - surfaced to the caller
                 self.last_error = f"FlareSolverr: {exc}"
                 log.error("could not solve the challenge: %s", exc)
@@ -181,7 +194,7 @@ class RuTrackerSession:
             self._login(captcha_code)
             self._generation += 1
 
-    def _login(self, captcha_code: str | None = None) -> None:
+    def _login(self, captcha_code: str | None = None, attempt: int = 1) -> None:
         if not config.USERNAME or not config.PASSWORD:
             raise LoginFailed("no credentials configured")
 
@@ -219,9 +232,12 @@ class RuTrackerSession:
         self._absorb_cookies(response)
 
         if looks_like_challenge(response.status, response.headers, response.content):
-            if not self.refresh_clearance():
+            if attempt >= MAX_LOGIN_ATTEMPTS:
+                self.last_error = "login.php keeps returning a challenge"
+                raise LoginFailed(self.last_error)
+            if not self.refresh_clearance(path=LOGIN_PATH):
                 raise LoginFailed("a challenge blocks login.php and it could not be solved")
-            return self._login(captcha_code)
+            return self._login(captcha_code, attempt + 1)
 
         # A successful login answers 302; only the follow-up page carries the marker.
         if LOGGED_IN_MARKER not in response.content:
@@ -249,7 +265,7 @@ class RuTrackerSession:
         self._absorb_cookies(response)
 
         if looks_like_challenge(response.status, response.headers, response.content):
-            if not self.refresh_clearance():
+            if not self.refresh_clearance(path=LOGIN_PATH):
                 raise LoginFailed("a challenge blocks login.php and it could not be solved")
             response = self.upstream.request(
                 "GET", LOGIN_PATH, headers=self.headers(), cookies=self.cookies()

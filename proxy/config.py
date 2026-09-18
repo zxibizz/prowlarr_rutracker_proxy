@@ -47,22 +47,8 @@ def _bool(name: str, default: bool) -> bool:
 BIND = _text("PROXY_BIND", "0.0.0.0")
 PORT = _int("PROXY_PORT", 8790)
 
-# Hosts whose CONNECT is terminated here with a cert minted by our own CA.
-# Everything else is blind-tunnelled, which is what keeps Prowlarr's proxy health
-# check against prowlarr.servarr.com working untouched.
-MITM_HOSTS = [host.lower() for host in _list("MITM_HOSTS", "rutracker.org,rutracker.net")]
-
-# Hosts whose blind tunnel is still routed through SOCKS5 rather than going direct.
-# static.rutracker.cc serves the login captcha and is blocked in the same places
-# the tracker itself is.
-SOCKS_TUNNEL_SUFFIXES = [
-    host.lower()
-    for host in _list("SOCKS_TUNNEL_SUFFIXES", "rutracker.org,rutracker.net,rutracker.cc,rutracker.nl")
-]
-
 # ------------------------------------------------------------------ storage
 STATE_DIR = _text("STATE_DIR", "/data")
-CA_DIR = _text("CA_DIR", os.path.join(STATE_DIR, "ca"))
 STATE_PATH = os.path.join(STATE_DIR, "session.json")
 
 # ------------------------------------------------------------------ upstream
@@ -110,16 +96,6 @@ def canonical_host() -> str:
 
 def mirror_hosts() -> list[str]:
     return [url.split("://", 1)[-1].split("/", 1)[0] for url in MIRRORS]
-
-
-def is_mitm_host(host: str) -> bool:
-    host = (host or "").lower()
-    return any(host == entry or host.endswith("." + entry) for entry in MITM_HOSTS)
-
-
-def tunnel_via_socks(host: str) -> bool:
-    host = (host or "").lower()
-    return any(host == entry or host.endswith("." + entry) for entry in SOCKS_TUNNEL_SUFFIXES)
 
 
 def setup_logging() -> None:

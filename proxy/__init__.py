@@ -1,1 +1,1 @@
-"""MITM HTTP proxy that fronts RuTracker for Prowlarr."""
+"""Reverse proxy that fronts RuTracker for Prowlarr."""

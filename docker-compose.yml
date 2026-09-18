@@ -7,9 +7,8 @@
 #
 # Order of operations on a fresh checkout:
 #   1. cp .env.example .env and fill in credentials and the SOCKS5 endpoint
-#   2. docker compose up -d --build     (the proxy generates ./data/ca/ca.crt)
-#   3. docker compose restart prowlarr  (picks the new CA up via /custom-cont-init.d)
-#   4. python3 scripts/configure_proxy.py
+#   2. docker compose up -d --build
+#   3. python3 scripts/configure_proxy.py     (points the indexer's Base Url here)
 
 services:
   flaresolverr:
@@ -41,12 +40,11 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-UTC}
     volumes:
-      # The CA and the tracker session. Prowlarr mounts ./data/ca read-only to
-      # install the certificate, so this directory is the link between the two.
+      # The tracker session, so a restart does not force a fresh login.
       - ./data:/data
     ports:
-      # Published so you can poke at /status and /ca.crt from the host while
-      # developing. Prowlarr reaches it over the compose network instead.
+      # Prowlarr reaches this as its indexer Base Url, so it has to be published
+      # on an address Prowlarr can route to.
       - "8790:8790"
     restart: unless-stopped
 
@@ -61,9 +59,6 @@ services:
       - TZ=${TZ:-UTC}
     volumes:
       - ./config:/config
-      - ./data/ca:/rutracker-ca:ro
-      # Runs as root before Prowlarr starts; see prowlarr-init/README.
-      - ./prowlarr-init:/custom-cont-init.d:ro
     ports:
       - "9696:9696"
     restart: unless-stopped
