@@ -16,7 +16,7 @@ ENV PROXY_PORT=8790 \
 VOLUME ["/data"]
 EXPOSE 8790
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python3 -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8790/healthz',timeout=4)"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python3 -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8790/healthz',timeout=9)"
 
 CMD ["python3", "-m", "proxy"]

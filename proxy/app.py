@@ -26,7 +26,7 @@ The proxy:
 
 Everything under ``/forum/`` is the tracker. The rest is local:
 
-    GET  /healthz    liveness probe
+    GET  /healthz    503 when the SOCKS5 tunnel carries no traffic
     GET  /           what this service is and how it is wired
     GET  /status     active mirror, session age, last error
     GET  /captcha    the pending login captcha image, when there is one
@@ -241,7 +241,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/healthz":
-            self._send_json(200, {"ok": True})
+            error = self.server.upstream.probe_socks()
+            if error:
+                self._send_json(503, {"ok": False, "error": error})
+            else:
+                self._send_json(200, {"ok": True})
         elif path == "/status":
             self._send_json(
                 200,
@@ -269,7 +273,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "mirrors": config.MIRRORS,
                     "endpoints": {
                         "/forum/...": "the tracker itself",
-                        "/healthz": "liveness probe",
+                        "/healthz": "503 when the SOCKS5 tunnel carries no traffic",
                         "/status": "active mirror, session age, last error",
                         "/captcha": "pending login captcha image, if any",
                         "POST /login": "finish a captcha-blocked login: code=<value>",

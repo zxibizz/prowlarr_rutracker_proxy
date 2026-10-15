@@ -69,6 +69,12 @@ MIRROR_FAIL_THRESHOLD = _int("MIRROR_FAIL_THRESHOLD", 2)
 MIRROR_RECHECK_SECONDS = _float("MIRROR_RECHECK_SECONDS", 900.0)
 REQUEST_DELAY = _float("REQUEST_DELAY", 0.25)
 
+# /healthz fetches this through SOCKS5; a neutral host so the probe never touches
+# the tracker. Empty disables the probe.
+HEALTH_PROBE_URL = _text("HEALTH_PROBE_URL", "https://www.google.com/generate_204")
+HEALTH_PROBE_TIMEOUT = _float("HEALTH_PROBE_TIMEOUT", 5.0)
+HEALTH_PROBE_CACHE_SECONDS = 15.0
+
 # ------------------------------------------------------------------ flaresolverr
 FLARESOLVERR_URL = _text("FLARESOLVERR_URL", "http://flaresolverr:8191").rstrip("/")
 FLARESOLVERR_TIMEOUT_MS = _int("FLARESOLVERR_TIMEOUT_MS", 60000)

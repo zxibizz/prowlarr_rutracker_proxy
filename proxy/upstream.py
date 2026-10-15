@@ -83,6 +83,10 @@ class Upstream:
         self._state_lock = threading.Lock()
         self._gate_lock = threading.Lock()
         self._last_request = 0.0
+        self._probe_lock = threading.Lock()
+        # monotonic() can start near 0, so 0.0 would read as a fresh result.
+        self._probe_at = float("-inf")
+        self._probe_error: str | None = None
 
         self.session = requests.Session()
         self.session.trust_env = False
@@ -226,6 +230,28 @@ class Upstream:
         for host in self._foreign_hosts:
             value = value.replace(host, self.canonical_host)
         return value
+
+    def probe_socks(self) -> str | None:
+        """Check the SOCKS5 tunnel actually carries traffic; returns an error or None."""
+        if not config.SOCKS5_URL or not config.HEALTH_PROBE_URL:
+            return None
+        with self._probe_lock:
+            if time.monotonic() - self._probe_at < config.HEALTH_PROBE_CACHE_SECONDS:
+                return self._probe_error
+            previous = self._probe_error
+            try:
+                self.session.get(
+                    config.HEALTH_PROBE_URL, timeout=config.HEALTH_PROBE_TIMEOUT, allow_redirects=False
+                ).close()
+                self._probe_error = None
+                if previous:
+                    log.info("SOCKS5 probe recovered")
+            except requests.RequestException as exc:
+                self._probe_error = f"SOCKS5 probe failed: {exc}"
+                if not previous:
+                    log.warning("%s", self._probe_error)
+            self._probe_at = time.monotonic()
+            return self._probe_error
 
     def status(self) -> dict:
         with self._state_lock:

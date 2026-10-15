@@ -143,7 +143,7 @@ scripts/test_indexer.py               end to end through Prowlarr
 | Endpoint | What it does |
 | --- | --- |
 | `/forum/...` | the tracker itself |
-| `GET /healthz` | liveness probe, used by the container healthcheck |
+| `GET /healthz` | container healthcheck; 503 when `HEALTH_PROBE_URL` can't be fetched through SOCKS5 |
 | `GET /` | what this service is and how it is wired |
 | `GET /status` | active mirror, session age, clearance cookies, last error |
 | `GET /captcha` | the pending login captcha image, when there is one |
@@ -163,6 +163,8 @@ scripts/test_indexer.py               end to end through Prowlarr
 | `MIRROR_RECHECK_SECONDS` | `900` | how long a demoted mirror stays demoted |
 | `REQUEST_DELAY` | `0.25` | minimum gap between upstream requests, in seconds |
 | `HTTP_TIMEOUT` | `30` | per-request timeout, in seconds |
+| `HEALTH_PROBE_URL` | `https://www.google.com/generate_204` | fetched through SOCKS5 by `/healthz` (cached 15 s); empty disables |
+| `HEALTH_PROBE_TIMEOUT` | `5` | probe timeout, in seconds |
 | `PROXY_PORT` | `8790` | listener port |
 | `STATE_DIR` | `/data` | where the session lives |
 | `LOG_LEVEL` | `INFO` | `DEBUG` logs every upstream URL |
