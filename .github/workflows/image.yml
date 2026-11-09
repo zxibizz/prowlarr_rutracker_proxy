@@ -1,8 +1,9 @@
 name: Image
 
 # Every push to main publishes an image to GHCR; pull requests only build it.
-# Tags: `main`, `sha-<short>` and, for a v* git tag, the version.
-# Deploy by digest: the digest is printed in the job summary.
+# Tags: `main`, `sha-<short>`, `main-<YYYYMMDDhhmmss>-<short>` and, for a v* git tag,
+# the version. The timestamped tag sorts by build time, which is what Flux image
+# automation in the homelab cluster follows to roll out new builds by digest.
 on:
   push:
     branches: [main]
@@ -53,6 +54,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha
+            type=raw,value=main-{{date 'YYYYMMDDHHmmss'}}-{{sha}},enable={{is_default_branch}}
             type=semver,pattern={{version}}
           labels: |
             org.opencontainers.image.title=prowlarr_rutracker_proxy

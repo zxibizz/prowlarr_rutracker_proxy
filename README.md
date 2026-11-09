@@ -121,6 +121,7 @@ to `main`, publishes it to GHCR:
 ```
 ghcr.io/zxibizz/prowlarr_rutracker_proxy:main        # moves with main
 ghcr.io/zxibizz/prowlarr_rutracker_proxy:sha-<short> # one per commit
+ghcr.io/zxibizz/prowlarr_rutracker_proxy:main-<YYYYMMDDhhmmss>-<short>  # sortable, for automation
 ```
 
 Deploy by digest (it is printed in the run's summary) rather than by tag. The
