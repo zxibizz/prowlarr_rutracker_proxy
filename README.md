@@ -112,6 +112,20 @@ can actually route to:
 python3 scripts/configure_proxy.py http://192.168.1.10:8790/
 ```
 
+## Published image
+
+GitHub Actions (`.github/workflows/image.yml`) runs the offline tests, builds the
+image, smoke-tests it (non-root, read-only root filesystem) and, on every push
+to `main`, publishes it to GHCR:
+
+```
+ghcr.io/zxibizz/prowlarr_rutracker_proxy:main        # moves with main
+ghcr.io/zxibizz/prowlarr_rutracker_proxy:sha-<short> # one per commit
+```
+
+Deploy by digest (it is printed in the run's summary) rather than by tag. The
+image runs as uid 1000 and only writes to `/data`.
+
 ## Verifying
 
 ```
@@ -128,6 +142,8 @@ yields bytes starting with `d8:announce` rather than an HTML error page.
 ```
 docker-compose.yml                    Prowlarr + the proxy + FlareSolverr
 Dockerfile                            the proxy image
+.github/workflows/image.yml           tests, build, publish to GHCR
+tests/                                offline unit tests
 proxy/config.py                       every environment knob, in one place
 proxy/upstream.py                     SOCKS5, mirror failover, hostname rewriting
 proxy/session.py                      login, bb_session/cf_clearance, captcha handling
