@@ -47,3 +47,23 @@ class CookieTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CookieJarTest(unittest.TestCase):
+    def test_set_cookie_does_not_shadow_explicit_cookies(self) -> None:
+        from email.message import Message
+
+        import requests
+        from requests.cookies import MockRequest, MockResponse
+
+        up = Upstream()
+        headers = Message()
+        headers["Set-Cookie"] = "cf_clearance=STALE; Domain=.rutracker.org; Path=/"
+        prepared = requests.Request("GET", "https://rutracker.org/forum/index.php").prepare()
+        up.session.cookies.extract_cookies(MockResponse(headers), MockRequest(prepared))
+        self.assertEqual(len(up.session.cookies), 0)
+
+        request = requests.Request(
+            "GET", "https://rutracker.org/forum/tracker.php", cookies={"cf_clearance": "FRESH"}
+        )
+        self.assertEqual(up.session.prepare_request(request).headers["Cookie"], "cf_clearance=FRESH")

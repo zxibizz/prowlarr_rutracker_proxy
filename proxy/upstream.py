@@ -21,6 +21,7 @@ encoding-safe and cheaper than a decode/encode round trip.
 
 from __future__ import annotations
 
+import http.cookiejar
 import logging
 import threading
 import time
@@ -90,6 +91,11 @@ class Upstream:
 
         self.session = requests.Session()
         self.session.trust_env = False
+        # Cookies are owned by SessionState and passed explicitly on every request.
+        # A jar that also keeps Set-Cookie values sends them first, so a stale
+        # cf_clearance shadows every fresh one FlareSolverr hands over and the
+        # challenge never clears until the process restarts.
+        self.session.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
         if config.SOCKS5_URL:
             self.session.proxies = {"http": config.SOCKS5_URL, "https": config.SOCKS5_URL}
             log.info("upstream traffic goes through %s", _redact(config.SOCKS5_URL))
