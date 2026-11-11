@@ -89,18 +89,38 @@ class Upstream:
         self._probe_at = float("-inf")
         self._probe_error: str | None = None
 
-        self.session = requests.Session()
-        self.session.trust_env = False
+        self._session_lock = threading.Lock()
+        self.session = self._new_session()
+        if config.SOCKS5_URL:
+            log.info("upstream traffic goes through %s", _redact(config.SOCKS5_URL))
+        else:
+            log.warning("SOCKS5_URL is empty; upstream traffic goes out directly")
+
+    @staticmethod
+    def _new_session() -> requests.Session:
+        session = requests.Session()
+        session.trust_env = False
         # Cookies are owned by SessionState and passed explicitly on every request.
         # A jar that also keeps Set-Cookie values sends them first, so a stale
         # cf_clearance shadows every fresh one FlareSolverr hands over and the
         # challenge never clears until the process restarts.
-        self.session.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+        session.cookies.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
         if config.SOCKS5_URL:
-            self.session.proxies = {"http": config.SOCKS5_URL, "https": config.SOCKS5_URL}
-            log.info("upstream traffic goes through %s", _redact(config.SOCKS5_URL))
-        else:
-            log.warning("SOCKS5_URL is empty; upstream traffic goes out directly")
+            session.proxies = {"http": config.SOCKS5_URL, "https": config.SOCKS5_URL}
+        return session
+
+    def reset_connections(self) -> None:
+        """Drop every pooled connection and start a clean requests.Session.
+
+        A long-lived process once kept getting the challenge with a clearance that
+        a fresh process in the same pod, sending the same cookies, passed with;
+        only a restart helped. Whatever state it was, a new session drops it.
+        """
+        # The old session is not closed: another thread may still be reading from
+        # it. Its pool goes away with the last reference.
+        with self._session_lock:
+            self.session = self._new_session()
+        log.info("upstream connections reset")
 
     # ------------------------------------------------------------------ mirrors
     @property

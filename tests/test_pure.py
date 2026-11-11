@@ -67,3 +67,53 @@ class CookieJarTest(unittest.TestCase):
             "GET", "https://rutracker.org/forum/tracker.php", cookies={"cf_clearance": "FRESH"}
         )
         self.assertEqual(up.session.prepare_request(request).headers["Cookie"], "cf_clearance=FRESH")
+
+
+class StubbornChallengeTest(unittest.TestCase):
+    """A clearance that does not help must not be re-fetched from the same browser."""
+
+    def _session(self, solver):
+        import tempfile
+
+        from proxy import config
+        from proxy.session import RuTrackerSession
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        original = config.STATE_PATH
+        config.STATE_PATH = os.path.join(tmp.name, "session.json")
+        self.addCleanup(setattr, config, "STATE_PATH", original)
+        return RuTrackerSession(Upstream(), solver)
+
+    def _solver(self):
+        calls = []
+
+        class Solver:
+            def solve(self, url):
+                calls.append("solve")
+                return {"cf_clearance": f"C{len(calls)}"}, "UA"
+
+            def destroy(self):
+                calls.append("destroy")
+
+        return Solver(), calls
+
+    def test_first_challenge_reuses_browser_and_connections(self) -> None:
+        solver, calls = self._solver()
+        session = self._session(solver)
+        before = session.upstream.session
+        self.assertTrue(session.refresh_clearance(path="/forum/tracker.php"))
+        self.assertEqual(calls, ["solve"])
+        self.assertIs(session.upstream.session, before)
+
+    def test_repeated_challenge_resets_browser_and_connections(self) -> None:
+        solver, calls = self._solver()
+        session = self._session(solver)
+        before = session.upstream.session
+        self.assertTrue(session.refresh_clearance(path="/forum/tracker.php", stubborn=True))
+        self.assertEqual(calls, ["destroy", "solve"])
+        self.assertIsNot(session.upstream.session, before)
+        self.assertEqual(session.cf_cookies, {"cf_clearance": "C2"})
+        # the new session keeps the jar policy that rejects Set-Cookie
+        self.assertEqual(len(session.upstream.session.cookies), 0)
+        self.assertEqual(session.upstream.session.cookies.get_policy().allowed_domains(), ())

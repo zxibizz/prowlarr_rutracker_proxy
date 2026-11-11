@@ -141,7 +141,9 @@ class RuTrackerSession:
         return self._clearance_generation
 
     # ------------------------------------------------------------------ challenge
-    def refresh_clearance(self, seen_generation: int | None = None, path: str | None = None) -> bool:
+    def refresh_clearance(
+        self, seen_generation: int | None = None, path: str | None = None, stubborn: bool = False
+    ) -> bool:
         """Solve the interstitial once, however many callers noticed it at the same time.
 
         The clearance is scoped to the Cloudflare rule that issued the challenge,
@@ -149,10 +151,19 @@ class RuTrackerSession:
         earned on index.php is rejected by login.php, which is protected harder.
         Solving an unchallenged page yields "Challenge not detected" and a cookie
         that clears nothing.
+
+        ``stubborn`` means the clearance just won did not help. Then the browser
+        session is thrown away (its Chrome may pass on an old cookie of its own
+        and never be challenged, so it never earns a new one) and so are the
+        upstream connections, before solving again from scratch.
         """
         with self._clearance_lock:
             if seen_generation is not None and seen_generation != self._clearance_generation:
                 return True
+            if stubborn:
+                log.warning("the fresh clearance did not help; resetting the browser session and connections")
+                self.solver.destroy()
+                self.upstream.reset_connections()
             # A browser pointed at dl.php downloads a torrent instead of rendering.
             if not path or path.startswith("/forum/dl.php"):
                 path = INDEX_PATH

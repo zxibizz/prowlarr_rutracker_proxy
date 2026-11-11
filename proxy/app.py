@@ -170,7 +170,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if looks_like_challenge(response.status, response.headers, response.content):
                 log.info("challenge on %s (attempt %d)", target, attempt + 1)
                 if not session.refresh_clearance(
-                    clearance_generation, urllib.parse.urlsplit(target).path
+                    clearance_generation,
+                    urllib.parse.urlsplit(target).path,
+                    stubborn=attempt > 0,
                 ):
                     self._send_bytes(
                         502, "text/plain; charset=utf-8", b"a challenge could not be solved"
