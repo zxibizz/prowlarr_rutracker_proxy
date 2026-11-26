@@ -67,7 +67,10 @@ class RuTrackerSession:
         self.upstream = upstream
         self.solver = solver
         self.bb_session = ""
+        # The latest clearance, and the one won on each mirror: a cf_clearance
+        # only counts on the host that issued it.
         self.cf_cookies: dict[str, str] = {}
+        self.cf_by_mirror: dict[str, dict[str, str]] = {}
         self.user_agent = config.DEFAULT_USER_AGENT
         self.updated_at = 0.0
         self.last_error = ""
@@ -95,10 +98,15 @@ class RuTrackerSession:
 
         self.bb_session = state.get("bb_session") or ""
         self.cf_cookies = state.get("cf_cookies") or {}
+        self.cf_by_mirror = state.get("cf_by_mirror") or {}
         self.user_agent = state.get("user_agent") or config.DEFAULT_USER_AGENT
         self.updated_at = state.get("updated_at") or 0.0
         if self.cf_cookies:
             self.clearance_mirror = state.get("clearance_mirror") or None
+            if not self.cf_by_mirror:
+                # A state file from before per-mirror clearances: keep using it.
+                owner = self.clearance_mirror or state.get("mirror") or self.upstream.active
+                self.cf_by_mirror[owner] = dict(self.cf_cookies)
         if self.bb_session:
             age = (time.time() - self.updated_at) / 3600.0
             log.info("restored a session from %s (%.1fh old)", config.STATE_PATH, age)
@@ -107,6 +115,7 @@ class RuTrackerSession:
         state = {
             "bb_session": self.bb_session,
             "cf_cookies": self.cf_cookies,
+            "cf_by_mirror": self.cf_by_mirror,
             "user_agent": self.user_agent,
             "updated_at": self.updated_at,
             "mirror": self.upstream.active,
@@ -120,8 +129,9 @@ class RuTrackerSession:
         os.replace(tmp, config.STATE_PATH)
 
     # ------------------------------------------------------------------ cookies
-    def cookies(self) -> dict[str, str]:
-        jar = dict(self.cf_cookies)
+    def cookies(self, mirror: str | None = None) -> dict[str, str]:
+        """Cookies for ``mirror``: its own clearance, or the latest one if it has none."""
+        jar = dict(self.cf_by_mirror.get(mirror or self.upstream.active) or self.cf_cookies)
         if self.bb_session:
             jar["bb_session"] = self.bb_session
         return jar
@@ -207,6 +217,7 @@ class RuTrackerSession:
 
             # bb_session may come back too if the browser was already logged in.
             self.cf_cookies = {name: value for name, value in cookies.items() if name != "bb_session"}
+            self.cf_by_mirror[mirror] = dict(self.cf_cookies)
             if cookies.get("bb_session"):
                 self.bb_session = cookies["bb_session"]
             self.user_agent = user_agent
@@ -270,7 +281,7 @@ class RuTrackerSession:
                 }
             ),
             body=body,
-            cookies=self.cookies(),
+            cookies=self.cookies,
         )
         self._absorb_cookies(response)
 
@@ -286,7 +297,7 @@ class RuTrackerSession:
         # A successful login answers 302; only the follow-up page carries the marker.
         if LOGGED_IN_MARKER not in response.content:
             probe = self.upstream.request(
-                "GET", INDEX_PATH, headers=self.headers(), cookies=self.cookies()
+                "GET", INDEX_PATH, headers=self.headers(), cookies=self.cookies
             )
             self._absorb_cookies(probe)
             if LOGGED_IN_MARKER not in probe.content:
@@ -305,14 +316,14 @@ class RuTrackerSession:
 
     def _login_form(self) -> dict:
         """GET the login page, clear any challenge, and read the captcha fields if present."""
-        response = self.upstream.request("GET", LOGIN_PATH, headers=self.headers(), cookies=self.cookies())
+        response = self.upstream.request("GET", LOGIN_PATH, headers=self.headers(), cookies=self.cookies)
         self._absorb_cookies(response)
 
         if looks_like_challenge(response.status, response.headers, response.content):
             if not self.refresh_clearance(path=LOGIN_PATH, mirror=response.mirror, demote=True):
                 raise LoginFailed("a challenge blocks login.php and it could not be solved")
             response = self.upstream.request(
-                "GET", LOGIN_PATH, headers=self.headers(), cookies=self.cookies()
+                "GET", LOGIN_PATH, headers=self.headers(), cookies=self.cookies
             )
             self._absorb_cookies(response)
 
@@ -359,6 +370,8 @@ class RuTrackerSession:
                     self.bb_session = morsel.value
                 elif key.startswith("cf_") or key.startswith("__ddg"):
                     self.cf_cookies[key] = morsel.value
+                    if response.mirror in self.upstream.mirrors:
+                        self.cf_by_mirror.setdefault(response.mirror, {})[key] = morsel.value
 
     def status(self) -> dict:
         return {

@@ -152,14 +152,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # after one means the clearance did not help.
         cleared: set[str] = set()
         switched = False
+        # Where this request last won a clearance: the rest of it goes there first.
+        pinned: str | None = None
+        pinned_at = 0
         attempts = MAX_ATTEMPTS
         attempt = 0
         while attempt < attempts:
             attempt += 1
             clearance_generation = session.clearance_generation
             demotions = upstream.demotions
+            if pinned and demotions != pinned_at:
+                pinned = None  # another request moved the mirrors meanwhile
             login_generation = session.generation
-            extra = {"Referer": upstream.active + "/forum/index.php"}
+            extra = {"Referer": (pinned or upstream.active) + "/forum/index.php"}
             if content_type:
                 extra["Content-Type"] = content_type
             try:
@@ -168,7 +173,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     target,
                     headers=session.headers(extra),
                     body=body,
-                    cookies=session.cookies(),
+                    cookies=session.cookies,
+                    prefer=pinned,
                 )
             except UpstreamError as exc:
                 log.error("%s %s: %s", method, target, exc)
@@ -192,11 +198,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if won_on:
                     # Another request may have won it meanwhile, on another mirror.
                     cleared.add(won_on)
+                    pinned, pinned_at = won_on, upstream.demotions
                     continue
                 # One switch per request, and it does not use up an attempt: a
                 # second unsolvable mirror is not worth the wait.
                 if not switched and upstream.demotions != demotions and upstream.active != mirror:
                     switched = True
+                    pinned = None
                     attempts += 1
                     log.info("retrying %s on %s", target, upstream.active)
                     continue

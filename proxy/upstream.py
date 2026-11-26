@@ -25,6 +25,7 @@ import http.cookiejar
 import logging
 import threading
 import time
+from typing import Callable
 
 import requests
 
@@ -181,8 +182,9 @@ class Upstream:
             if self.mirrors[self._index] == mirror:
                 self._failures = 0
 
-    def _order(self) -> list[str]:
-        start = self.mirrors.index(self.active)
+    def _order(self, prefer: str | None = None) -> list[str]:
+        first = prefer if prefer in self.mirrors else self.active
+        start = self.mirrors.index(first)
         return self.mirrors[start:] + self.mirrors[:start]
 
     # ------------------------------------------------------------------ requests
@@ -192,17 +194,23 @@ class Upstream:
         path_qs: str,
         headers: dict[str, str] | None = None,
         body: bytes | None = None,
-        cookies: dict[str, str] | None = None,
+        cookies: dict[str, str] | Callable[[str], dict[str, str]] | None = None,
+        prefer: str | None = None,
     ) -> UpstreamResponse:
-        """Issue one request against whichever mirror is healthy, and rewrite the answer."""
+        """Issue one request against whichever mirror is healthy, and rewrite the answer.
+
+        ``cookies`` may be a function of the mirror: a Cloudflare clearance only
+        counts on the host it was won on. ``prefer`` tries that mirror first.
+        """
         if not path_qs.startswith("/"):
             path_qs = "/" + path_qs
 
         last_error: Exception | None = None
-        for mirror in self._order():
+        for mirror in self._order(prefer):
             url = mirror + path_qs
+            jar = cookies(mirror) if callable(cookies) else cookies
             try:
-                response = self._send(method, url, headers, body, cookies)
+                response = self._send(method, url, headers, body, jar)
             except requests.RequestException as exc:
                 last_error = exc
                 log.warning("%s %s failed: %s", method, url, exc)

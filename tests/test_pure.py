@@ -166,10 +166,12 @@ class MirrorSwitchOnUnsolvedChallengeTest(unittest.TestCase):
             response = requests.Response()
             response.url = url
             response.headers["Content-Type"] = "text/html"
+            # a clearance only counts on the mirror that issued it
+            valid = (cookies or {}).get("cf_clearance") == f"C-{mirror}"
             if mirror in cleared and mirror in stubborn_left:
                 stubborn_left.discard(mirror)
                 response.status_code, response._content = 403, self.CHALLENGE
-            elif mirror in cleared:
+            elif valid:
                 response.status_code, response._content = 200, self.RESULTS
             else:
                 response.status_code, response._content = 403, self.CHALLENGE
@@ -186,7 +188,7 @@ class MirrorSwitchOnUnsolvedChallengeTest(unittest.TestCase):
                 if mirror not in solvable or (mirror in broken_after_first and solved.count(mirror) > 1):
                     raise ChallengeUnsolved("Error: Error solving the challenge. Timeout after 60.0 seconds.")
                 cleared.add(mirror)
-                return {"cf_clearance": "C"}, "UA"
+                return {"cf_clearance": f"C-{mirror}"}, "UA"
 
             def destroy(self):
                 pass
@@ -243,6 +245,25 @@ class MirrorSwitchOnUnsolvedChallengeTest(unittest.TestCase):
         self.assertEqual(r.solved[0], NET)
         self.assertEqual(r.answers, [(200, self.RESULTS)])
 
+    def test_clearances_of_both_mirrors_survive_a_flaky_preferred_one(self) -> None:
+        import requests
+
+        # org: challenge, solved, then one 5xx-like failure -> net: challenge, solved
+        state = {"org_calls": 0}
+
+        def fails(mirror):
+            if mirror == ORG:
+                state["org_calls"] += 1
+                if state["org_calls"] == 2:
+                    return requests.ConnectionError("525-like failure")
+            return None
+
+        r = self._relay(solvable={ORG, NET}, fails=fails)
+        self.assertEqual(r.answers, [(200, self.RESULTS)])
+        self.assertEqual(r.solved, [ORG, NET])
+        # the request stays on net once it won a clearance there
+        self.assertEqual(r.sent, [ORG, ORG, NET, NET])
+
     def test_unsolvable_fallback_mirror_is_solved_once(self) -> None:
         import requests
 
@@ -287,6 +308,27 @@ class MirrorSwitchOnUnsolvedChallengeTest(unittest.TestCase):
         r = self._relay(solvable={ORG, NET}, error=requests.ConnectionError("connection refused"))
         self.assertEqual(r.answers, [(502, b"a challenge could not be solved")])
         self.assertEqual(r.up.active, ORG)
+
+
+class LegacyStateTest(unittest.TestCase):
+    def test_clearance_from_an_older_state_file_is_still_sent(self) -> None:
+        import json
+        import tempfile
+
+        from proxy import config
+        from proxy.session import RuTrackerSession
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        original = config.STATE_PATH
+        config.STATE_PATH = os.path.join(tmp.name, "session.json")
+        self.addCleanup(setattr, config, "STATE_PATH", original)
+        with open(config.STATE_PATH, "w", encoding="utf-8") as handle:
+            json.dump({"bb_session": "S", "cf_cookies": {"cf_clearance": "X"}, "mirror": ORG}, handle)
+
+        session = RuTrackerSession(Upstream(), solver=None)
+        self.assertEqual(session.cf_by_mirror, {ORG: {"cf_clearance": "X"}})
+        self.assertEqual(session.cookies(ORG)["cf_clearance"], "X")
 
 
 class DemoteTest(unittest.TestCase):

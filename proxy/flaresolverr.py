@@ -145,7 +145,10 @@ class FlareSolverr:
         try:
             body = self._post(payload)
         except ChallengeUnsolved:
-            # The browser did reach the page; another one would only take as long again.
+            # Retrying would take as long again, but a wedged browser must not
+            # be reused: the next solve starts with a fresh session.
+            if session_id:
+                self.destroy()
             raise
         except FlareSolverrError:
             if not session_id:
