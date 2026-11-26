@@ -81,6 +81,8 @@ class Upstream:
         self._index = 0
         self._failures = 0
         self._demoted_at = 0.0
+        # Bumped on every switch made by demote().
+        self.demotions = 0
         self._state_lock = threading.Lock()
         self._gate_lock = threading.Lock()
         self._last_request = 0.0
@@ -148,6 +150,31 @@ class Upstream:
             self._failures = 0
             self._demoted_at = time.time()
             log.warning("%s keeps failing, switching to %s", mirror, self.mirrors[self._index])
+
+    def demote(self, mirror: str) -> None:
+        """Move off ``mirror`` now because its challenge cannot be solved.
+
+        Such a mirror still answers, so the failure counter never sees it:
+        index.php goes through while every search gets the interstitial. Waiting
+        for it to recover would mean answering 502 for as long as it stays broken.
+        The preferred mirror is not taken back before its cooldown is over, so
+        two broken mirrors do not take turns on every request.
+        """
+        with self._state_lock:
+            self._maybe_restore_preferred()
+            if self.mirrors[self._index] != mirror or len(self.mirrors) < 2:
+                return
+            target = (self._index + 1) % len(self.mirrors)
+            cooling = time.time() - self._demoted_at < config.MIRROR_RECHECK_SECONDS
+            if target == 0 and config.MIRROR_RECHECK_SECONDS > 0 and cooling:
+                log.warning("%s cannot get past the challenge either; staying until the cooldown is over", mirror)
+                return
+            if self._index == 0:
+                self._demoted_at = time.time()
+            self._index = target
+            self._failures = 0
+            self.demotions += 1
+            log.warning("%s cannot get past the challenge, switching to %s", mirror, self.mirrors[target])
 
     def _note_success(self, mirror: str) -> None:
         with self._state_lock:

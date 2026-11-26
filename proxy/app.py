@@ -145,15 +145,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_bytes(502, "text/plain; charset=utf-8", str(exc).encode())
             return
 
-        extra = {"Referer": upstream.active + "/forum/index.php"}
         content_type = self.headers.get("Content-Type")
-        if content_type:
-            extra["Content-Type"] = content_type
 
         response = None
-        for attempt in range(MAX_ATTEMPTS):
+        # Mirrors whose clearance was won during this request: a challenge right
+        # after one means the clearance did not help.
+        cleared: set[str] = set()
+        switched = False
+        attempts = MAX_ATTEMPTS
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
             clearance_generation = session.clearance_generation
+            demotions = upstream.demotions
             login_generation = session.generation
+            extra = {"Referer": upstream.active + "/forum/index.php"}
+            if content_type:
+                extra["Content-Type"] = content_type
             try:
                 response = upstream.request(
                     method,
@@ -168,20 +176,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
 
             if looks_like_challenge(response.status, response.headers, response.content):
-                log.info("challenge on %s (attempt %d)", target, attempt + 1)
-                if not session.refresh_clearance(
+                mirror = response.mirror
+                log.info("challenge on %s from %s (attempt %d)", target, mirror, attempt)
+                if attempt == attempts:
+                    # A clearance won now could never be used.
+                    break
+                won_on = session.refresh_clearance(
                     clearance_generation,
                     urllib.parse.urlsplit(target).path,
-                    stubborn=attempt > 0,
-                ):
-                    self._send_bytes(
-                        502, "text/plain; charset=utf-8", b"a challenge could not be solved"
-                    )
-                    return
-                continue
+                    stubborn=mirror in cleared,
+                    mirror=mirror,
+                    demote=True,
+                    seen_demotions=demotions,
+                )
+                if won_on:
+                    # Another request may have won it meanwhile, on another mirror.
+                    cleared.add(won_on)
+                    continue
+                # One switch per request, and it does not use up an attempt: a
+                # second unsolvable mirror is not worth the wait.
+                if not switched and upstream.demotions != demotions and upstream.active != mirror:
+                    switched = True
+                    attempts += 1
+                    log.info("retrying %s on %s", target, upstream.active)
+                    continue
+                self._send_bytes(502, "text/plain; charset=utf-8", b"a challenge could not be solved")
+                return
 
             if self._needs_relogin(response, target):
-                log.info("session looks expired on %s (attempt %d)", target, attempt + 1)
+                log.info("session looks expired on %s (attempt %d)", target, attempt)
                 try:
                     session.relogin(login_generation)
                 except CaptchaRequired as exc:
@@ -196,6 +219,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if response is None:
             self._send_bytes(502, "text/plain; charset=utf-8", b"no response from any mirror")
+            return
+        if looks_like_challenge(response.status, response.headers, response.content):
+            # Out of attempts with the interstitial still in hand: it is not a tracker page.
+            self._send_bytes(502, "text/plain; charset=utf-8", b"a challenge could not be solved")
             return
 
         log.info(

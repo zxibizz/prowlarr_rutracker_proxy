@@ -31,7 +31,7 @@ import urllib.parse
 from http.cookies import SimpleCookie
 
 from . import config
-from .flaresolverr import FlareSolverr, FlareSolverrError, looks_like_challenge
+from .flaresolverr import ChallengeUnsolved, FlareSolverr, FlareSolverrError, looks_like_challenge
 from .upstream import Upstream, UpstreamResponse
 
 log = logging.getLogger("session")
@@ -77,6 +77,8 @@ class RuTrackerSession:
         self._clearance_lock = threading.Lock()
         self._generation = 0
         self._clearance_generation = 0
+        # The mirror the current clearance was won on.
+        self.clearance_mirror: str | None = None
 
         self._load()
 
@@ -95,6 +97,8 @@ class RuTrackerSession:
         self.cf_cookies = state.get("cf_cookies") or {}
         self.user_agent = state.get("user_agent") or config.DEFAULT_USER_AGENT
         self.updated_at = state.get("updated_at") or 0.0
+        if self.cf_cookies:
+            self.clearance_mirror = state.get("clearance_mirror") or None
         if self.bb_session:
             age = (time.time() - self.updated_at) / 3600.0
             log.info("restored a session from %s (%.1fh old)", config.STATE_PATH, age)
@@ -106,6 +110,7 @@ class RuTrackerSession:
             "user_agent": self.user_agent,
             "updated_at": self.updated_at,
             "mirror": self.upstream.active,
+            "clearance_mirror": self.clearance_mirror,
         }
         os.makedirs(os.path.dirname(config.STATE_PATH), exist_ok=True)
         tmp = config.STATE_PATH + ".tmp"
@@ -142,8 +147,14 @@ class RuTrackerSession:
 
     # ------------------------------------------------------------------ challenge
     def refresh_clearance(
-        self, seen_generation: int | None = None, path: str | None = None, stubborn: bool = False
-    ) -> bool:
+        self,
+        seen_generation: int | None = None,
+        path: str | None = None,
+        stubborn: bool = False,
+        mirror: str | None = None,
+        demote: bool = False,
+        seen_demotions: int | None = None,
+    ) -> str | None:
         """Solve the interstitial once, however many callers noticed it at the same time.
 
         The clearance is scoped to the Cloudflare rule that issued the challenge,
@@ -156,10 +167,27 @@ class RuTrackerSession:
         session is thrown away (its Chrome may pass on an old cookie of its own
         and never be challenged, so it never earns a new one) and so are the
         upstream connections, before solving again from scratch.
+
+        ``mirror`` is the one that served the challenge (the active one by
+        default); ``clearance_mirror`` remembers where the current clearance was
+        won. With ``demote``, a challenge FlareSolverr cannot pass takes that
+        mirror out of rotation so the caller can retry on the next one; a caller
+        that queued behind such a switch (``seen_demotions`` is stale) gets None
+        straight away instead of waiting out another solve.
+
+        Returns the mirror the current clearance belongs to, or None on failure.
         """
         with self._clearance_lock:
             if seen_generation is not None and seen_generation != self._clearance_generation:
-                return True
+                return self.clearance_mirror or mirror or self.upstream.active
+            if (
+                demote
+                and seen_demotions is not None
+                and seen_demotions != self.upstream.demotions
+                and mirror is not None
+                and mirror != self.upstream.active
+            ):
+                return None
             if stubborn:
                 log.warning("the fresh clearance did not help; resetting the browser session and connections")
                 self.solver.destroy()
@@ -167,12 +195,15 @@ class RuTrackerSession:
             # A browser pointed at dl.php downloads a torrent instead of rendering.
             if not path or path.startswith("/forum/dl.php"):
                 path = INDEX_PATH
+            mirror = mirror or self.upstream.active
             try:
-                cookies, user_agent = self.solver.solve(self.upstream.active + path)
+                cookies, user_agent = self.solver.solve(mirror + path)
             except (FlareSolverrError, Exception) as exc:  # noqa: BLE001 - surfaced to the caller
                 self.last_error = f"FlareSolverr: {exc}"
-                log.error("could not solve the challenge: %s", exc)
-                return False
+                log.error("could not solve the challenge on %s: %s", mirror, exc)
+                if demote and isinstance(exc, ChallengeUnsolved):
+                    self.upstream.demote(mirror)
+                return None
 
             # bb_session may come back too if the browser was already logged in.
             self.cf_cookies = {name: value for name, value in cookies.items() if name != "bb_session"}
@@ -180,9 +211,10 @@ class RuTrackerSession:
                 self.bb_session = cookies["bb_session"]
             self.user_agent = user_agent
             self.updated_at = time.time()
+            self.clearance_mirror = mirror
             self._clearance_generation += 1
             self._save()
-            return True
+            return mirror
 
     # ------------------------------------------------------------------ login
     def ensure(self) -> None:
@@ -246,7 +278,8 @@ class RuTrackerSession:
             if attempt >= MAX_LOGIN_ATTEMPTS:
                 self.last_error = "login.php keeps returning a challenge"
                 raise LoginFailed(self.last_error)
-            if not self.refresh_clearance(path=LOGIN_PATH):
+            # Demoting lets the next request log in on another mirror.
+            if not self.refresh_clearance(path=LOGIN_PATH, mirror=response.mirror, demote=True):
                 raise LoginFailed("a challenge blocks login.php and it could not be solved")
             return self._login(captcha_code, attempt + 1)
 
@@ -276,7 +309,7 @@ class RuTrackerSession:
         self._absorb_cookies(response)
 
         if looks_like_challenge(response.status, response.headers, response.content):
-            if not self.refresh_clearance(path=LOGIN_PATH):
+            if not self.refresh_clearance(path=LOGIN_PATH, mirror=response.mirror, demote=True):
                 raise LoginFailed("a challenge blocks login.php and it could not be solved")
             response = self.upstream.request(
                 "GET", LOGIN_PATH, headers=self.headers(), cookies=self.cookies()

@@ -42,6 +42,15 @@ class FlareSolverrError(Exception):
     pass
 
 
+class ChallengeUnsolved(FlareSolverrError):
+    """FlareSolverr reached the page but could not get past the challenge in time."""
+
+
+def _raise_if_unsolved(message: str) -> None:
+    if "solving the challenge" in message.lower():
+        raise ChallengeUnsolved(message)
+
+
 def looks_like_challenge(status: int, headers: list[tuple[str, str]], body: bytes) -> bool:
     """Is this an interstitial rather than the page we asked for?"""
     for name, value in headers:
@@ -77,10 +86,18 @@ class FlareSolverr:
     def _post(self, payload: dict) -> dict:
         timeout = config.FLARESOLVERR_TIMEOUT_MS / 1000.0 + 30.0
         response = self._http.post(f"{self.url}/v1", json=payload, timeout=timeout)
+        if response.status_code >= 400:
+            # A challenge it cannot pass comes back as HTTP 500 with a JSON message.
+            try:
+                _raise_if_unsolved(str(response.json().get("message") or ""))
+            except (ValueError, AttributeError):
+                pass
         response.raise_for_status()
         body = response.json()
         if body.get("status") != "ok":
-            raise FlareSolverrError(body.get("message") or "FlareSolverr returned a non-ok status")
+            message = body.get("message") or "FlareSolverr returned a non-ok status"
+            _raise_if_unsolved(message)
+            raise FlareSolverrError(message)
         return body
 
     def _ensure_session(self) -> str | None:
@@ -127,6 +144,9 @@ class FlareSolverr:
         log.info("asking FlareSolverr to solve %s", url)
         try:
             body = self._post(payload)
+        except ChallengeUnsolved:
+            # The browser did reach the page; another one would only take as long again.
+            raise
         except FlareSolverrError:
             if not session_id:
                 raise
